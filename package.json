@@ -1,0 +1,21 @@
+{
+  "name": "northgate-os",
+  "version": "0.1.0",
+  "description": "Northgate Construction AI Operating System — orchestration engine, departments, and integrations",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/main.ts",
+    "start": "tsx src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "tsx": "^4.16.0"
+  }
+}
