@@ -14,6 +14,11 @@ interface Config { url: string; serviceKey: string }
 export class SupabaseStore implements Store {
   constructor(private cfg: Config) {}
 
+  /** Public read helper for the KPI engine (read-only queries). */
+  async query(path: string): Promise<Record<string, unknown>[]> {
+    return (await this.rest(path)) as Record<string, unknown>[];
+  }
+
   private async rest(path: string, init: RequestInit = {}): Promise<unknown> {
     const res = await fetch(`${this.cfg.url}/rest/v1/${path}`, {
       ...init,
