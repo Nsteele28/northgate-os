@@ -9,11 +9,16 @@ import type { SupabaseStore } from '../adapters/supabaseStore.js';
 
 export interface DailyKpis {
   date: string;
-  // Outreach (Charles)
+  // Outreach (Charles — our campaign only)
   messagesSent: number;
   messagesDelivered: number;
   messagesFailed: number;
   deliveryRate: number;
+  // ALL GoHighLevel activity (incl. messages/calls not set up by our system)
+  ghlTotalSms: number;
+  ghlTotalCalls: number;
+  ghlCallMinutes: number;
+  ghlEstimatedSpendUsd: number;
   // Inbound
   inboundMessages: number;
   inboundCalls: number;
@@ -87,7 +92,7 @@ export class KpiEngine {
     return this.store.query(path);
   }
 
-  async computeDay(dayIso: string): Promise<DailyKpis> {
+  async computeDay(dayIso: string, ghlTotals?: { sms: number; calls: number; callMins: number; spendUsd: number }): Promise<DailyKpis> {
     const start = `${dayIso}T00:00:00Z`;
     const end = `${dayIso}T23:59:59Z`;
     const conv = await this.q(`conversations?occurred_at=gte.${start}&occurred_at=lte.${end}&limit=100000`);
@@ -99,10 +104,16 @@ export class KpiEngine {
     const inbound = conv.filter(c => c.direction === 'inbound');
     const sms = (c: Record<string, unknown>) => c.channel === 'sms';
     const call = (c: Record<string, unknown>) => c.channel === 'call';
+    // OUR campaign = outbound texts carrying a Charles script tag.
+    const ourCampaign = (c: Record<string, unknown>) => sms(c) && c.script_tag != null;
 
-    const sent = outbound.filter(sms).length;
-    const delivered = outbound.filter(c => sms(c) && c.delivered === true).length;
-    const failed = outbound.filter(c => sms(c) && c.delivered === false).length;
+    const sent = outbound.filter(ourCampaign).length;
+    const delivered = outbound.filter(c => ourCampaign(c) && c.delivered === true).length;
+    const failed = outbound.filter(c => ourCampaign(c) && c.delivered === false).length;
+
+    // ALL GHL activity — prefer the live sync tally; fall back to the log.
+    const ghlTotalSms = ghlTotals?.sms ?? conv.filter(sms).length;
+    const ghlTotalCalls = ghlTotals?.calls ?? conv.filter(call).length;
 
     const replies = inbound.filter(sms);
     const pos = replies.filter(c => classify(String(c.body ?? '')) === 'positive').length;
@@ -122,6 +133,10 @@ export class KpiEngine {
       messagesDelivered: delivered,
       messagesFailed: failed,
       deliveryRate: sent ? +(delivered / sent).toFixed(3) : 0,
+      ghlTotalSms,
+      ghlTotalCalls,
+      ghlCallMinutes: ghlTotals?.callMins ?? 0,
+      ghlEstimatedSpendUsd: ghlTotals?.spendUsd ?? 0,
       inboundMessages: inbound.filter(sms).length,
       inboundCalls: inbound.filter(call).length,
       missedCalls: audit.filter(a => a.action === 'call.missed').length,

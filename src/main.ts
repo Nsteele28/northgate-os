@@ -18,6 +18,7 @@ import { CommsService } from './departments/framework.js';
 import { ExecutiveOps } from './health/executiveOps.js';
 import { KpiEngine } from './reporting/kpis.js';
 import { GhlSync } from './integrations/ghlSync.js';
+import { SmsWatchdog, type WatchdogAlert } from './health/smsWatchdog.js';
 import type { OutboundMessage } from './core/types.js';
 
 const env = (k: string, fallback?: string): string => {
@@ -37,6 +38,9 @@ const compliance = new ComplianceEngine(store);
 const approvals = new ApprovalService(store);
 const director = new OperationsDirector(store);
 
+// The watchdog can slam the brakes on outreach if the pipe breaks.
+let campaignPaused = false;
+
 // In propose mode the "transport" never touches a customer: every
 // would-be send becomes a task for a human to review in the queue.
 const transport = async (msg: OutboundMessage): Promise<void> => {
@@ -49,6 +53,9 @@ const transport = async (msg: OutboundMessage): Promise<void> => {
     });
     return;
   }
+  if (campaignPaused) {
+    throw new Error('CAMPAIGN_PAUSED: watchdog paused outbound while the SMS pipe is unhealthy');
+  }
   // live mode: GHL adapter wiring goes here per-channel (Phase 2 flip)
   throw new Error('live transport not yet enabled — flip departments one at a time');
 };
@@ -56,18 +63,62 @@ const transport = async (msg: OutboundMessage): Promise<void> => {
 const comms = new CommsService(store, compliance, transport);
 void comms; // departments attach here as campaign phases activate
 
+// Immediate, multi-channel owner alert — used for anything critical.
+async function alertOwnerImmediate(headline: string, detail: string): Promise<void> {
+  // email (separate deliverability from SMS) + SMS (best effort) + log
+  try {
+    const emailId = await ownerContactId({ email: OWNER_EMAIL });
+    if (emailId) await fetch(`${GHL_BASE}/conversations/messages`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ type: 'Email', contactId: emailId, subject: `🚨 Northgate ALERT: ${headline}`, html: `<h2>${headline}</h2><p>${detail}</p><p style="color:#888">Automatic alert from your Northgate system watchdog.</p>` }) }).catch(() => {});
+  } catch { /* email path down */ }
+  try {
+    const smsId = await ownerContactId({ phone: OWNER_PHONE });
+    if (smsId) await fetch(`${GHL_BASE}/conversations/messages`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ type: 'SMS', contactId: smsId, message: `NORTHGATE ALERT: ${headline}. ${detail}` }) }).catch(() => {});
+  } catch { /* sms path down — email still went */ }
+  await store.appendAudit({ actor: 'sms_watchdog', action: 'owner.alerted', after: { headline, detail } });
+}
+
 const notifyManagement = async (e: { what: string; recommendedAction: string }): Promise<void> => {
-  // Paging wiring (SMS to owners) activates with live mode; until then
-  // escalations surface in the dashboard + task queue, never silently.
   await store.createTask({
     owner: 'human',
     title: `🚨 ESCALATION: ${e.what}`,
     detail: { recommendedAction: e.recommendedAction },
     createdBy: 'executive_operations',
   });
+  // Critical escalations reach Natalie's phone immediately, not just the queue.
+  await alertOwnerImmediate(e.what, e.recommendedAction).catch(() => {});
 };
 
 const execOps = new ExecutiveOps(store, director, approvals, notifyManagement);
+
+// ── SMS pipeline watchdog: the lifeblood monitor ───────────────────
+async function ghlCanary(): Promise<boolean> {
+  // Lightweight authenticated GHL call: if the token + account respond,
+  // the SMS channel is almost certainly back. Avoids spamming test texts.
+  if (!process.env.GHL_API_KEY || !process.env.GHL_LOCATION_ID) return false;
+  try {
+    const r = await fetch(`${GHL_BASE}/locations/${process.env.GHL_LOCATION_ID}`, { headers: ghlHeaders() });
+    return r.ok;
+  } catch { return false; }
+}
+
+const watchdog = new SmsWatchdog(
+  store,
+  async (a: WatchdogAlert) => {
+    if (a.severity === 'recovered') {
+      await alertOwnerImmediate(a.headline, a.detail);
+    } else {
+      await alertOwnerImmediate(a.headline, a.detail);
+    }
+    console.log(`[watchdog:${a.severity}] ${a.headline} — ${a.detail}`);
+  },
+  ghlCanary,
+  (paused) => { campaignPaused = paused; },
+);
+
+async function watchdogLoop(): Promise<void> {
+  try { await watchdog.check(MODE); }
+  catch (err) { console.error('[watchdog] check failed:', err); }
+}
 
 // ── The loops ──────────────────────────────────────────────────────
 
@@ -141,7 +192,9 @@ async function maybeRunDailyReport(): Promise<void> {
   if (now.getHours() < REPORT_HOUR_ET || lastReportDay === day) return;
   lastReportDay = day;
   try {
-    const kpis = await kpi.computeDay(day);
+    const todaySpend = dailySpend[day] ?? 0;
+    const todayCounts = dailyCounts[day] ?? { sms: 0, calls: 0, callMins: 0 };
+    const kpis = await kpi.computeDay(day, { sms: todayCounts.sms, calls: todayCounts.calls, callMins: todayCounts.callMins, spendUsd: todaySpend });
     let prior;
     try {
       const yday = new Date(now.getTime() - 86_400_000).toISOString().slice(0, 10);
@@ -201,8 +254,10 @@ async function emailOwner(day: string, report: import('./reporting/kpis.js').Dai
   const contactId = await ownerContactId({ email: OWNER_EMAIL });
   if (!contactId) return;
   const recLines = report.recommendations.map(r => `• [${r.severity.toUpperCase()}] ${r.area}: ${r.proposedChange}${r.gated ? ' (waiting for your approval)' : ''}`).join('<br>');
+  const k = report.kpis;
   const html = `<h2>Northgate — Daily Report, ${day}</h2><p>${report.narrative}</p>` +
-    `<h3>GoHighLevel activity &amp; spend</h3><p>${counts.sms} texts, ${counts.calls} calls (${counts.callMins} min). Estimated GHL spend: <b>$${spend.toFixed(2)}</b> <span style="color:#888">(estimate — exact billing is in your GHL wallet)</span></p>` +
+    `<h3>Charles's campaign (what we sent)</h3><p>${k.messagesSent} texts sent, ${k.messagesDelivered} delivered, ${k.replies} replies, ${k.inspectionsBooked} inspections booked.</p>` +
+    `<h3>All GoHighLevel activity &amp; spend</h3><p>Everything in the Northgate sub-account today (including messages and calls not set up by our system): <b>${counts.sms} texts</b>, <b>${counts.calls} calls</b> (${counts.callMins} min). Estimated GHL spend: <b>$${spend.toFixed(2)}</b> <span style="color:#888">(estimate — exact billing is in your GHL wallet)</span></p>` +
     (report.recommendations.length ? `<h3>Recommended changes</h3>${recLines}` : '<p>No changes recommended today.</p>') +
     `<p style="color:#888">Gated changes are in your approval queue — nothing changes in GoHighLevel until you approve.</p>`;
   await fetch(`${GHL_BASE}/conversations/messages`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ type: 'Email', contactId, subject: `Northgate Daily Report — ${day}`, html }) }).catch(() => {});
@@ -216,9 +271,9 @@ async function smsOwnerDigest(day: string, report: import('./reporting/kpis.js')
   const urgent = report.recommendations.filter(r => r.severity === 'urgent').length;
   const lines = [
     `Northgate ${day.slice(5)}`,
-    `Sent ${k.messagesSent} | Replies ${k.replies} (${(k.replyRate * 100).toFixed(0)}%) | Booked ${k.inspectionsBooked}`,
-    `In: ${counts.calls} calls, ${k.inboundMessages} texts | Opt-outs ${k.optOuts}`,
-    `GHL spend ~$${spend.toFixed(2)}`,
+    `Charles: sent ${k.messagesSent} | replies ${k.replies} (${(k.replyRate * 100).toFixed(0)}%) | booked ${k.inspectionsBooked}`,
+    `All GHL: ${counts.sms} texts, ${counts.calls} calls | spend ~$${spend.toFixed(2)}`,
+    `Opt-outs ${k.optOuts}`,
     report.recommendations.length ? `${report.recommendations.length} change(s) to review${urgent ? ` (${urgent} urgent)` : ''} — check email/dashboard.` : 'No changes to review.',
   ];
   await fetch(`${GHL_BASE}/conversations/messages`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ type: 'SMS', contactId, message: lines.join('\n') }) }).catch(() => {});
@@ -227,10 +282,12 @@ async function smsOwnerDigest(day: string, report: import('./reporting/kpis.js')
 setInterval(drainLoop, 30_000);
 setInterval(sweepLoop, 15 * 60_000);
 setInterval(ghlSyncLoop, 10 * 60_000);       // pull GHL messages/calls/spend
+setInterval(watchdogLoop, 60_000);            // SMS pipeline watchdog — every minute
 setInterval(maybeRunDailyReport, 5 * 60_000); // checks every 5 min; fires once after REPORT_HOUR_ET
 void drainLoop();
 void sweepLoop();
 void ghlSyncLoop();
+void watchdogLoop();
 void maybeRunDailyReport();
 
 // ── Health endpoint (Railway pings this) ───────────────────────────
@@ -238,9 +295,12 @@ void maybeRunDailyReport();
 const port = Number(process.env.PORT ?? 8080);
 createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const smsState = watchdog.state;
+    const ok = smsState === 'healthy';
+    res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      ok: true, mode: MODE, lastDrain, lastSweep, drains, sweeps,
+      ok, mode: MODE, smsPipeline: smsState, campaignPaused,
+      lastDrain, lastSweep, drains, sweeps,
     }));
     return;
   }
