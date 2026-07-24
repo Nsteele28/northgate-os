@@ -17,6 +17,7 @@ import { OperationsDirector } from './director/router.js';
 import { CommsService } from './departments/framework.js';
 import { ExecutiveOps } from './health/executiveOps.js';
 import { KpiEngine } from './reporting/kpis.js';
+import { GhlSync } from './integrations/ghlSync.js';
 import type { OutboundMessage } from './core/types.js';
 
 const env = (k: string, fallback?: string): string => {
@@ -100,8 +101,35 @@ async function sweepLoop(): Promise<void> {
 
 const kpi = new KpiEngine(store);
 const OWNER_EMAIL = process.env.OWNER_EMAIL ?? 'ngc.nsteele@gmail.com';
+const OWNER_PHONE = process.env.OWNER_PHONE ?? '+17343955440'; // Natalie
 const REPORT_HOUR_ET = Number(process.env.REPORT_HOUR_ET ?? 20); // 8pm ET default
 let lastReportDay = '';
+
+// ── GoHighLevel sync: count every message, call, and dollar ────────
+const ghlSync = (process.env.GHL_API_KEY && process.env.GHL_LOCATION_ID)
+  ? new GhlSync(store, process.env.GHL_API_KEY, process.env.GHL_LOCATION_ID,
+      (k, ok, err) => execOps.heartbeat(k, 'executive_operations', ok, err))
+  : null;
+
+const dailySpend: Record<string, number> = {};
+const dailyCounts: Record<string, { sms: number; calls: number; callMins: number }> = {};
+let lastGhlSyncIso: string | undefined;
+
+async function ghlSyncLoop(): Promise<void> {
+  if (!ghlSync) return;
+  try {
+    const r = await ghlSync.sync(lastGhlSyncIso);
+    lastGhlSyncIso = new Date(Date.now() - 60_000).toISOString();
+    const day = nowInDetroit().toISOString().slice(0, 10);
+    dailySpend[day] = (dailySpend[day] ?? 0) + r.estimatedSpendUsd;
+    const c = dailyCounts[day] ?? { sms: 0, calls: 0, callMins: 0 };
+    c.sms += r.smsCount; c.calls += r.callCount; c.callMins += r.callMinutes;
+    dailyCounts[day] = c;
+    if (r.messagesInserted > 0) console.log(`[ghl-sync] +${r.messagesInserted} msgs, ${r.callCount} calls, ~$${r.estimatedSpendUsd} spend`);
+  } catch (err) {
+    console.error('[ghl-sync] failed:', err);
+  }
+}
 
 function nowInDetroit(): Date {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Detroit' }));
@@ -147,35 +175,62 @@ async function maybeRunDailyReport(): Promise<void> {
       }).catch(e => console.error('[report] approval failed', e));
     }
 
-    // 3. Email the story to Natalie (internal owner notification — not
-    //    customer outreach, so it bypasses propose mode).
-    await emailOwner(day, report).catch(e => console.error('[report] email failed', e));
-    console.log(`[report] daily report for ${day} generated: ${report.recommendations.length} recommendations`);
+    // 3. Deliver the story to Natalie — email (full) + SMS (digest).
+    const spend = dailySpend[day] ?? 0;
+    const counts = dailyCounts[day] ?? { sms: 0, calls: 0, callMins: 0 };
+    await emailOwner(day, report, spend, counts).catch(e => console.error('[report] email failed', e));
+    await smsOwnerDigest(day, report, spend, counts).catch(e => console.error('[report] sms failed', e));
+    console.log(`[report] daily report for ${day}: ${report.recommendations.length} recs, ~$${spend.toFixed(2)} GHL spend`);
   } catch (err) {
     console.error('[report] failed:', err);
   }
 }
 
-async function emailOwner(day: string, report: import('./reporting/kpis.js').DailyReport): Promise<void> {
-  const key = process.env.GHL_API_KEY, loc = process.env.GHL_LOCATION_ID;
-  if (!key || !loc) return;
-  const base = 'https://services.leadconnectorhq.com';
-  const H = { Authorization: `Bearer ${key}`, Version: '2021-07-28', 'Content-Type': 'application/json' };
-  const up = await fetch(`${base}/contacts/upsert`, { method: 'POST', headers: H, body: JSON.stringify({ email: OWNER_EMAIL, locationId: loc, firstName: 'Natalie', tags: ['owner-reports'] }) }).then(r => r.json()).catch(() => null) as { contact?: { id: string } } | null;
-  const contactId = up?.contact?.id;
+type Counts = { sms: number; calls: number; callMins: number };
+const GHL_BASE = 'https://services.leadconnectorhq.com';
+function ghlHeaders() { return { Authorization: `Bearer ${process.env.GHL_API_KEY}`, Version: '2021-07-28', 'Content-Type': 'application/json' }; }
+
+async function ownerContactId(extra: Record<string, unknown>): Promise<string | null> {
+  const loc = process.env.GHL_LOCATION_ID;
+  if (!process.env.GHL_API_KEY || !loc) return null;
+  const up = await fetch(`${GHL_BASE}/contacts/upsert`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ locationId: loc, firstName: 'Natalie', tags: ['owner-reports'], ...extra }) }).then(r => r.json()).catch(() => null) as { contact?: { id: string } } | null;
+  return up?.contact?.id ?? null;
+}
+
+async function emailOwner(day: string, report: import('./reporting/kpis.js').DailyReport, spend: number, counts: Counts): Promise<void> {
+  const contactId = await ownerContactId({ email: OWNER_EMAIL });
   if (!contactId) return;
   const recLines = report.recommendations.map(r => `• [${r.severity.toUpperCase()}] ${r.area}: ${r.proposedChange}${r.gated ? ' (waiting for your approval)' : ''}`).join('<br>');
   const html = `<h2>Northgate — Daily Report, ${day}</h2><p>${report.narrative}</p>` +
+    `<h3>GoHighLevel activity &amp; spend</h3><p>${counts.sms} texts, ${counts.calls} calls (${counts.callMins} min). Estimated GHL spend: <b>$${spend.toFixed(2)}</b> <span style="color:#888">(estimate — exact billing is in your GHL wallet)</span></p>` +
     (report.recommendations.length ? `<h3>Recommended changes</h3>${recLines}` : '<p>No changes recommended today.</p>') +
     `<p style="color:#888">Gated changes are in your approval queue — nothing changes in GoHighLevel until you approve.</p>`;
-  await fetch(`${base}/conversations/messages`, { method: 'POST', headers: H, body: JSON.stringify({ type: 'Email', contactId, subject: `Northgate Daily Report — ${day}`, html }) }).catch(() => {});
+  await fetch(`${GHL_BASE}/conversations/messages`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ type: 'Email', contactId, subject: `Northgate Daily Report — ${day}`, html }) }).catch(() => {});
+}
+
+/** Short SMS digest to Natalie's phone — the headline numbers only. */
+async function smsOwnerDigest(day: string, report: import('./reporting/kpis.js').DailyReport, spend: number, counts: Counts): Promise<void> {
+  const contactId = await ownerContactId({ phone: OWNER_PHONE });
+  if (!contactId) return;
+  const k = report.kpis;
+  const urgent = report.recommendations.filter(r => r.severity === 'urgent').length;
+  const lines = [
+    `Northgate ${day.slice(5)}`,
+    `Sent ${k.messagesSent} | Replies ${k.replies} (${(k.replyRate * 100).toFixed(0)}%) | Booked ${k.inspectionsBooked}`,
+    `In: ${counts.calls} calls, ${k.inboundMessages} texts | Opt-outs ${k.optOuts}`,
+    `GHL spend ~$${spend.toFixed(2)}`,
+    report.recommendations.length ? `${report.recommendations.length} change(s) to review${urgent ? ` (${urgent} urgent)` : ''} — check email/dashboard.` : 'No changes to review.',
+  ];
+  await fetch(`${GHL_BASE}/conversations/messages`, { method: 'POST', headers: ghlHeaders(), body: JSON.stringify({ type: 'SMS', contactId, message: lines.join('\n') }) }).catch(() => {});
 }
 
 setInterval(drainLoop, 30_000);
 setInterval(sweepLoop, 15 * 60_000);
+setInterval(ghlSyncLoop, 10 * 60_000);       // pull GHL messages/calls/spend
 setInterval(maybeRunDailyReport, 5 * 60_000); // checks every 5 min; fires once after REPORT_HOUR_ET
 void drainLoop();
 void sweepLoop();
+void ghlSyncLoop();
 void maybeRunDailyReport();
 
 // ── Health endpoint (Railway pings this) ───────────────────────────
