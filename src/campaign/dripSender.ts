@@ -69,7 +69,9 @@ export class DripSender {
     if (!this.cfg.enabled) return null;
     const d = this.detroit();
     const day = d.toISOString().slice(0, 10);
-    if (d.getHours() < this.cfg.hourET || this.lastRunDay === day) return null;
+    // Fire only within the configured hour (e.g. the 9 AM hour), once/day.
+    // This guarantees it never blasts on an afternoon deploy/restart.
+    if (d.getHours() !== this.cfg.hourET || this.lastRunDay === day) return null;
     this.lastRunDay = day;
     return this.run();
   }
