@@ -19,6 +19,7 @@ import { ExecutiveOps } from './health/executiveOps.js';
 import { KpiEngine } from './reporting/kpis.js';
 import { GhlSync } from './integrations/ghlSync.js';
 import { SmsWatchdog, type WatchdogAlert } from './health/smsWatchdog.js';
+import { DripSender } from './campaign/dripSender.js';
 import type { OutboundMessage } from './core/types.js';
 
 const env = (k: string, fallback?: string): string => {
@@ -118,6 +119,37 @@ const watchdog = new SmsWatchdog(
 async function watchdogLoop(): Promise<void> {
   try { await watchdog.check(MODE); }
   catch (err) { console.error('[watchdog] check failed:', err); }
+}
+
+// ── Daily 9 AM drip: 100 recap texts/day to past_customer leads ────
+const dripSender = (process.env.GHL_API_KEY && process.env.GHL_LOCATION_ID)
+  ? new DripSender(
+      store, process.env.GHL_API_KEY, process.env.GHL_LOCATION_ID,
+      (headline, detail) => alertOwnerImmediate(headline, detail),
+      {
+        dailyCount: Number(process.env.DRIP_DAILY_COUNT ?? 100),
+        hourET: Number(process.env.DRIP_HOUR_ET ?? 9),
+        collisionWindowDays: 14,
+        perSendDelayMs: 1500,
+        enabled: (process.env.DRIP_ENABLED ?? 'true') === 'true',
+      },
+    )
+  : null;
+
+async function dripLoop(): Promise<void> {
+  if (!dripSender) return;
+  try {
+    const r = await dripSender.tick();
+    if (r) {
+      console.log(`[drip] 9AM run: sent ${r.sent}, skipped-active ${r.skippedActive}, skipped-optout ${r.skippedOptedOut}, failed ${r.failed}`);
+      await alertOwnerImmediate(
+        `Morning recap sent: ${r.sent} texts`,
+        `Charles texted ${r.sent} past customers this morning. Skipped ${r.skippedActive} already in a conversation and ${r.skippedOptedOut} opted-out. ${r.failed} failed. Replies will flow to you as they come in.`,
+      );
+    }
+  } catch (err) {
+    console.error('[drip] failed:', err);
+  }
 }
 
 // ── The loops ──────────────────────────────────────────────────────
@@ -283,11 +315,13 @@ setInterval(drainLoop, 30_000);
 setInterval(sweepLoop, 15 * 60_000);
 setInterval(ghlSyncLoop, 10 * 60_000);       // pull GHL messages/calls/spend
 setInterval(watchdogLoop, 60_000);            // SMS pipeline watchdog — every minute
+setInterval(dripLoop, 5 * 60_000);            // checks every 5 min; fires once at 9 AM ET
 setInterval(maybeRunDailyReport, 5 * 60_000); // checks every 5 min; fires once after REPORT_HOUR_ET
 void drainLoop();
 void sweepLoop();
 void ghlSyncLoop();
 void watchdogLoop();
+void dripLoop();
 void maybeRunDailyReport();
 
 // ── Health endpoint (Railway pings this) ───────────────────────────
