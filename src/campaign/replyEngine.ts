@@ -104,7 +104,7 @@ export class ReplyEngine {
 
     const cutoff = this.now() - this.cfg.lookbackHours * 3_600_000;
     const search = await fetch(`${this.base}/conversations/search?locationId=${this.ghlLoc}&limit=60&sortBy=last_message_date&sort=desc`, { headers: this.gh() })
-      .then(r => r.json()).catch(() => ({ conversations: [] })) as { conversations?: { id: string; contactId?: string; contactName?: string; fullName?: string; lastMessageDate?: string; lastMessageType?: string }[] };
+      .then(r => r.json()).catch(() => ({ conversations: [] })) as { conversations?: { id: string; contactId?: string; contactName?: string; fullName?: string; phone?: string; lastMessageDate?: string; lastMessageType?: string }[] };
 
     let processed = 0;
     for (const conv of search.conversations ?? []) {
@@ -120,7 +120,7 @@ export class ReplyEngine {
     return res;
   }
 
-  private async handleConversation(conv: { id: string; contactId?: string; contactName?: string; fullName?: string }, res: ReplyResult): Promise<boolean> {
+  private async handleConversation(conv: { id: string; contactId?: string; contactName?: string; fullName?: string; phone?: string }, res: ReplyResult): Promise<boolean> {
     const m = await fetch(`${this.base}/conversations/${conv.id}/messages?limit=25`, { headers: this.gh() })
       .then(r => r.json()).catch(() => null) as { messages?: { messages?: GhlMsg[] } | GhlMsg[] } | null;
     if (!m) return false;
@@ -148,11 +148,12 @@ export class ReplyEngine {
     const combined = inbound.map(x => x.body ?? '').join(' ');
     const intent = classify(combined);
     const contactId = conv.contactId!;
+    const cid = await this.custId(conv.phone);
 
     // Opt out — honor, do not reply.
     if (intent === 'opt_out') {
-      await this.markCustomerByContact(contactId, { opted_out: true, opted_out_at: new Date().toISOString() });
-      await this.logInbound(contactId, combined, 'opt_out');
+      if (cid) await this.sb(`customers?id=eq.${cid}`, { method: 'PATCH', body: JSON.stringify({ opted_out: true, opted_out_at: new Date().toISOString() }) });
+      await this.logInbound(cid, combined, 'opt_out');
       res.optOuts++;
       return true;
     }
@@ -167,11 +168,11 @@ export class ReplyEngine {
     const reply = this.pick(intent, first);
     const sent = await this.sendSms(contactId, reply);
     if (!sent) return false;
-    await this.logReply(contactId, combined, reply, intent);
+    await this.logReply(cid, combined, reply, intent);
     this.idx++;
 
-    if (intent === 'wrong_number') {
-      await this.markCustomerByContact(contactId, { opted_out: true, opted_out_at: new Date().toISOString() });
+    if (intent === 'wrong_number' && cid) {
+      await this.sb(`customers?id=eq.${cid}`, { method: 'PATCH', body: JSON.stringify({ opted_out: true, opted_out_at: new Date().toISOString() }) });
     }
     if (intent === 'book_time') {
       // Agreed to a time — a human confirms the actual appointment.
@@ -211,12 +212,19 @@ export class ReplyEngine {
     await this.sb(`customers?ghl_contact_id=eq.${ghlContactId}`, { method: 'PATCH', body: JSON.stringify(patch) });
   }
 
-  private async logReply(contactId: string, inbound: string, reply: string, intent: string) {
-    await this.sb('conversations', { method: 'POST', body: JSON.stringify({ channel: 'sms', direction: 'inbound', body: inbound, external_id: `in_${contactId}_${Date.now()}`, sentiment: intent, script_tag: 'recap_reply_in' }) });
-    await this.sb('conversations', { method: 'POST', body: JSON.stringify({ channel: 'sms', direction: 'outbound', actor: 'inside_sales', body: reply, external_id: `out_${contactId}_${Date.now()}`, script_tag: 'recap_reply_out', delivered: true, consent_basis: 'customer replied to us' }) });
+  private async custId(phone?: string): Promise<string | null> {
+    if (!phone) return null;
+    const rows = await this.store.query(`customers?phone_normalized=eq.${encodeURIComponent(phone)}&select=id&limit=1`).catch(() => []);
+    return rows[0] ? String(rows[0].id) : null;
   }
-  private async logInbound(contactId: string, inbound: string, intent: string) {
-    await this.sb('conversations', { method: 'POST', body: JSON.stringify({ channel: 'sms', direction: 'inbound', body: inbound, external_id: `in_${contactId}_${Date.now()}`, sentiment: intent, script_tag: 'recap_reply_in' }) });
+  private async logReply(cid: string | null, inbound: string, reply: string, intent: string) {
+    if (!cid) return; // conversations.customer_id is required; skip unlinked logs
+    await this.sb('conversations', { method: 'POST', body: JSON.stringify({ customer_id: cid, channel: 'sms', direction: 'inbound', body: inbound, sentiment: intent, consent_basis: 'recap_reply_in' }) });
+    await this.sb('conversations', { method: 'POST', body: JSON.stringify({ customer_id: cid, channel: 'sms', direction: 'outbound', actor: 'inside_sales', body: reply, delivered: true, consent_basis: 'recap_reply_out' }) });
+  }
+  private async logInbound(cid: string | null, inbound: string, intent: string) {
+    if (!cid) return;
+    await this.sb('conversations', { method: 'POST', body: JSON.stringify({ customer_id: cid, channel: 'sms', direction: 'inbound', body: inbound, sentiment: intent, consent_basis: 'recap_reply_in' }) });
   }
 
   private async escalate(conv: { contactName?: string; fullName?: string }, text: string, why: string) {

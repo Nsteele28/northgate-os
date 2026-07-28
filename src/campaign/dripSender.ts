@@ -173,8 +173,8 @@ export class DripSender {
       },
       body: JSON.stringify({
         customer_id: custId, opportunity_id: oppId, channel: 'sms', direction: 'outbound',
-        actor: 'inside_sales', body, script_tag: 'past_customer_recap',
-        external_id: extId, delivered, consent_basis: 'past customer established relationship',
+        actor: 'inside_sales', body,
+        external_id: extId, delivered, consent_basis: 'past_customer_recap',
       }),
     }).catch(() => {});
   }

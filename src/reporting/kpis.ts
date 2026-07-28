@@ -104,8 +104,8 @@ export class KpiEngine {
     const inbound = conv.filter(c => c.direction === 'inbound');
     const sms = (c: Record<string, unknown>) => c.channel === 'sms';
     const call = (c: Record<string, unknown>) => c.channel === 'call';
-    // OUR campaign = outbound texts carrying a Charles script tag.
-    const ourCampaign = (c: Record<string, unknown>) => sms(c) && c.script_tag != null;
+    // OUR campaign = outbound recap texts (tagged via consent_basis).
+    const ourCampaign = (c: Record<string, unknown>) => sms(c) && /recap/.test(String(c.consent_basis ?? ''));
 
     const sent = outbound.filter(ourCampaign).length;
     const delivered = outbound.filter(c => ourCampaign(c) && c.delivered === true).length;
