@@ -20,6 +20,7 @@ import { KpiEngine } from './reporting/kpis.js';
 import { GhlSync } from './integrations/ghlSync.js';
 import { SmsWatchdog, type WatchdogAlert } from './health/smsWatchdog.js';
 import { DripSender } from './campaign/dripSender.js';
+import { ReplyEngine } from './campaign/replyEngine.js';
 import type { OutboundMessage } from './core/types.js';
 
 const env = (k: string, fallback?: string): string => {
@@ -135,6 +136,30 @@ const dripSender = (process.env.GHL_API_KEY && process.env.GHL_LOCATION_ID)
       },
     )
   : null;
+
+// ── Charles reply engine: answers recap replies, books inspections ─
+const replyEngine = (process.env.GHL_API_KEY && process.env.GHL_LOCATION_ID)
+  ? new ReplyEngine(
+      store, process.env.GHL_API_KEY, process.env.GHL_LOCATION_ID,
+      (headline, detail) => alertOwnerImmediate(headline, detail),
+      {
+        enabled: (process.env.REPLY_ENABLED ?? 'true') === 'true',
+        debounceMinutes: 2, lookbackHours: 12, maxPerCycle: 40,
+      },
+    )
+  : null;
+
+async function replyLoop(): Promise<void> {
+  if (!replyEngine) return;
+  try {
+    const r = await replyEngine.cycle();
+    if (r.answered || r.escalated || r.optOuts) {
+      console.log(`[reply] answered ${r.answered}, escalated ${r.escalated}, opt-outs ${r.optOuts}, booked ${r.booked}`);
+    }
+  } catch (err) {
+    console.error('[reply] failed:', err);
+  }
+}
 
 async function dripLoop(): Promise<void> {
   if (!dripSender) return;
@@ -316,12 +341,14 @@ setInterval(sweepLoop, 15 * 60_000);
 setInterval(ghlSyncLoop, 10 * 60_000);       // pull GHL messages/calls/spend
 setInterval(watchdogLoop, 60_000);            // SMS pipeline watchdog — every minute
 setInterval(dripLoop, 5 * 60_000);            // checks every 5 min; fires once at 9 AM ET
+setInterval(replyLoop, 2 * 60_000);           // Charles answers replies every 2 min
 setInterval(maybeRunDailyReport, 5 * 60_000); // checks every 5 min; fires once after REPORT_HOUR_ET
 void drainLoop();
 void sweepLoop();
 void ghlSyncLoop();
 void watchdogLoop();
 void dripLoop();
+void replyLoop();
 void maybeRunDailyReport();
 
 // ── Health endpoint (Railway pings this) ───────────────────────────
